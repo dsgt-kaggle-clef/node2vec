@@ -414,6 +414,7 @@ class Node2VecSpark:
         vector_size: Optional[int] = None,
         random_seed: Optional[int] = None,
         checkpoint_dir: Optional[str] = None,
+        checkpoint_interval: int = 10,
     ) -> None:
         """
         A driver class for the distributed Node2Vec algorithm for vertex indexing,
@@ -433,6 +434,7 @@ class Node2VecSpark:
                            to set embedding dim here)
         :param random_seed: optional random seed, for testing only
         :param checkpoint_dir: str, an HDFS, s3 or gcs bucket as checkpointing directory
+        :param checkpoint_interval: int, the interval to checkpoint the random walk df
         """
         self.spark = spark
         self.random_seed = random_seed if random_seed else int(time.time())
@@ -443,6 +445,9 @@ class Node2VecSpark:
         self.max_out_degree = max_out_degree
         self.users = None if df_users is None else df_users.toDF("id")
         self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_interval = checkpoint_interval
+        if self.checkpoint_interval < 1:
+            raise ValueError("Invalid checkpoint interval, must be >= 1")
 
         # update n2v_params
         for param in NODE2VEC_PARAMS:
@@ -574,10 +579,14 @@ class Node2VecSpark:
         df_user = self.df_adj.select("id")
         if self.users is not None:
             df_user = df_user.join(self.users, on=["id"])
-        walks = self.spark.createDataFrame(
-            df_user.rdd.mapPartitions(initiate_random_walk(num_walks)),
-            schema=schema,
-        ).cache()
+        walks = (
+            self.spark.createDataFrame(
+                df_user.rdd.mapPartitions(initiate_random_walk(num_walks)),
+                schema=schema,
+            )
+            .repartition(NUM_PARTITIONS, ["src"])
+            .cache()
+        )
         logging.info(f"random_walk(): init walks length = {walks.count()}")
 
         # random walk with distributed bfs
@@ -593,8 +602,10 @@ class Node2VecSpark:
                     next_step_random_walk(param_p, param_q, self.random_seed)
                 ),
                 schema=schema,
-            )
-            if self.checkpoint_dir is not None and i % 10 == 9:
+            ).repartition(NUM_PARTITIONS, ["src"])
+            if self.checkpoint_dir is not None and i % self.checkpoint_interval == (
+                self.checkpoint_interval - 1
+            ):
                 walks = walks.checkpoint()
             else:
                 walks = walks.cache()
