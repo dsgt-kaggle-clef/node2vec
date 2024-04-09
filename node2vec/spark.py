@@ -579,6 +579,7 @@ class Node2VecSpark:
         df_user = self.df_adj.select("id")
         if self.users is not None:
             df_user = df_user.join(self.users, on=["id"])
+
         walks = (
             self.spark.createDataFrame(
                 df_user.rdd.mapPartitions(initiate_random_walk(num_walks)),
@@ -590,21 +591,33 @@ class Node2VecSpark:
         logging.info(f"random_walk(): init walks length = {walks.count()}")
 
         # random walk with distributed bfs
-        df_src = self.df_adj.select("id", "neighbors").toDF("src", "src_neighbors")
-        df_dst = self.df_adj.withColumnRenamed("id", "dst")
+        df_src = (
+            self.df_adj.select("id", "neighbors")
+            .toDF("src", "src_neighbors")
+            .repartition(NUM_PARTITIONS, ["src"])
+        ).cache()
+        df_dst = (
+            self.df_adj.withColumnRenamed("id", "dst")
+            .repartition(NUM_PARTITIONS, "dst")
+            .cache()
+        )
         param_p = self.n2v_params["return_param"]
         param_q = self.n2v_params["inout_param"]
         for i in range(self.n2v_params["walk_length"]):
-            next_walks = walks.join(df_src, on=["src"], how="left_outer")
-            next_walks = next_walks.join(df_dst, on=["dst"]).drop("dst")
+            next_walks = (
+                walks.join(df_src, on=["src"], how="left_outer")
+                .join(df_dst, on=["dst"])
+                .drop("dst")
+            )
+
             walks = self.spark.createDataFrame(
                 next_walks.rdd.mapPartitionsWithIndex(
                     next_step_random_walk(param_p, param_q, self.random_seed)
                 ),
                 schema=schema,
-            ).repartition(NUM_PARTITIONS, ["src"])
-            if self.checkpoint_dir is not None and i % self.checkpoint_interval == (
-                self.checkpoint_interval - 1
+            ).repartition(NUM_PARTITIONS, "src")
+            if self.checkpoint_dir is not None and (
+                i % self.checkpoint_interval == (self.checkpoint_interval - 1)
             ):
                 walks = walks.checkpoint()
             else:
@@ -612,15 +625,19 @@ class Node2VecSpark:
             logging.info(f"random_walk(): step {i} walks length = {walks.count()}")
 
         # convert paths back to lists
-        df_walks = self.spark.createDataFrame(
-            walks.rdd.mapPartitions(get_standard_paths),
-            schema=StructType(
-                [
-                    StructField("id", IntegerType(), False),
-                    StructField("walk", ArrayType(IntegerType()), False),
-                ]
-            ),
-        ).cache()
+        df_walks = (
+            self.spark.createDataFrame(
+                walks.rdd.mapPartitions(get_standard_paths),
+                schema=StructType(
+                    [
+                        StructField("id", IntegerType(), False),
+                        StructField("walk", ArrayType(IntegerType()), False),
+                    ]
+                ),
+            )
+            .repartition(NUM_PARTITIONS, "id")
+            .cache()
+        )
         logging.info(f"random_walk(): num of walks generated: {df_walks.count()}")
         return df_walks
 
